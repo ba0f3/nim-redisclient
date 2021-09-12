@@ -2,13 +2,14 @@
 # Copyright Ahmed T. Youssef
 # nim redis client
 
-import strutils, sequtils, net, asyncdispatch, asyncnet
+import strutils, strformat, parseutils, sequtils, net, asyncdispatch, asyncnet
 import redisparser except `$`
 export redisparser except `$`
 
 type
   RedisError* = object of IOError
   ConnectionError* = object of RedisError
+  InvalidReply* = object of RedisError
 
   RedisBase[TSocket] = ref object of RootObj
     socket: TSocket
@@ -26,6 +27,8 @@ type
     channel*: string
     message*: string
 
+template raiseError(x, msg) = raise newException(x, msg)
+
 when defined(ssl):
   proc SSLifyRedisConnectionNoVerify(redis: var Redis|AsyncRedis) =
     let ctx = newContext(verifyMode=CVerifyNone)
@@ -41,8 +44,11 @@ proc open*(host = "localhost", port = 6379.Port, ssl=false, timeout = -1): Redis
   when defined(ssl):
     if ssl == true:
       SSLifyRedisConnectionNoVerify(result)
-  result.socket.connect(host, port)
-  result.connected = true
+  try:
+    result.socket.connect(host, port)
+    result.connected = true
+  except OSError:
+    raiseError(ConnectionError, fmt"Unable to connect to server: {getCurrentExceptionMsg()}")
 
 proc openAsync*(host = "localhost", port = 6379.Port, ssl=false, timeout = -1): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous connection to a redis server.
@@ -60,9 +66,13 @@ proc openAsync*(host = "localhost", port = 6379.Port, ssl=false, timeout = -1): 
 proc receiveManaged*(this:Redis|AsyncRedis, size=1): Future[string] {.multisync.} =
   result = newString(size)
   when this is Redis:
-    discard this.socket.recv(result, size, this.timeout)
+    let bytesRead = this.socket.recv(result, size, this.timeout)
+    if bytesRead != size:
+      raiseError(InvalidReply, fmt"fail to recv data: {bytesRead} read, {size} expected")
   else:
-    discard await this.socket.recvInto(addr result[0], size)
+    let bytesRead = await this.socket.recvInto(addr result[0], size)
+    if bytesRead != size:
+      raiseError(InvalidReply, fmt"fail to recv data: {bytesRead} read, {size} expected")
   return result
 
 proc receiveLineManaged(this: Redis | AsyncRedis): Future[string] {.multisync.} =
@@ -74,21 +84,26 @@ proc receiveLineManaged(this: Redis | AsyncRedis): Future[string] {.multisync.} 
 proc readForm(this:Redis|AsyncRedis): Future[RedisValue] {.multisync.} =
   let data  = await this.receiveLineManaged()
   if unlikely(data.len == 0):
-    raise newException(ConnectionError, "Connection closed.")
+    raiseError(ConnectionError, "Server closed connection.")
 
   let b = data[0]
   if b notin ['+', '-', ':', '$', '*']:
-    raise newException(RedisError, "Protocol Error: " & data.repr)
+    raiseError(InvalidReply, fmt"Protocol Error: {data.repr}")
 
   case b
   of '+':
     result = newRedisString(data.substr(1))
   of '-':
-    result = newRedisError(data.substr(1))
+    raiseError(RedisError, data.substr(1))
   of ':':
-    result = newRedisInt(parseInt(data.substr(1)))
+    var val: int
+    if parseInt(data, val, 1) == 0:
+     raiseError(InvalidReply, fmt"Unable to parse integer: {data.substr(1)}")
+    result = newRedisInt(val)
   of '$':
-    let bulkLen = parseInt(data.substr(1))
+    var bulkLen: int
+    if parseInt(data, bulkLen, 1) == 0:
+      raiseError(InvalidReply, fmt"Unable to parse bulk string length: {data.substr(1)}")
     if bulkLen == 0:
       result = newRedisBulkString()
     elif bulkLen > 0:
@@ -96,7 +111,9 @@ proc readForm(this:Redis|AsyncRedis): Future[RedisValue] {.multisync.} =
       result = newRedisBulkString(body)
       discard await this.receiveManaged(CRLF_LEN)
   of '*':
-    let arraySize = parseInt(data.substr(1))
+    var arraySize: int
+    if parseInt(data, arraySize, 1) == 0:
+      raiseError(InvalidReply, fmt"Unable to parse array size: {data.substr(1)}")
     if arraySize == 0:
       result = newRedisArray()
     elif arraySize > 0:
@@ -106,7 +123,7 @@ proc readForm(this:Redis|AsyncRedis): Future[RedisValue] {.multisync.} =
         items.add(item)
       result = newRedisArray(items)
   else:
-    raise newException(RespError, "Unrecognized char " & b.repr)
+    raiseError(InvalidReply, fmt"Unrecognized char {b.repr}, line: {data}")
 
 proc execCommand*(this: Redis|AsyncRedis, command: string, args:seq[string]): Future[RedisValue] {.multisync.} =
   ## execute command `command` with arguments seq `args`
@@ -870,7 +887,12 @@ proc save*(this: Redis | AsyncRedis): Future[RedisValue] {.multisync.} =
 
 proc shutdown*(this: Redis | AsyncRedis): Future[RedisValue] {.multisync.} =
   ## Synchronously save the dataset to disk and then shut down the server
-  return await this.execCommand("SHUTDOWN")
+  try:
+    let val = await this.execCommand("SHUTDOWN")
+    if val != nil and val.isString():
+      raiseError(RedisError, val.getStr())
+  except ConnectionError:
+    discard
 
 proc slaveof*(this: Redis | AsyncRedis, host: string, port: string): Future[RedisValue] {.multisync.} =
   ## Make the server a slave of another instance, or promote it as master
