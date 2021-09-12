@@ -1,4 +1,4 @@
-import redisclient, unittest, re
+import redisclient, unittest, re, strutils
 
 ## Test cases borrowed from redis-py
 ## https://github.com/andymccurdy/redis-py/blob/master/tests/test_commands.py#L2691
@@ -61,10 +61,13 @@ template syncTests() =
     discard r.xadd(stream, "foo", "bar")
     discard r.xadd(stream, "foo", "bar")
     discard r.xadd(stream, "foo", "bar")
-    check r.xadd(stream, "foo", "bar", maxlen=3, limit=2).isError()
+
+    expect RedisError:
+      check r.xadd(stream, "foo", "bar", maxlen=3, limit=2).isError()
 
     # limit can not be provided without maxlen or minid
-    discard r.xadd(stream, "foo", "bar", limit=2).isError()
+    expect RedisError:
+      discard r.xadd(stream, "foo", "bar", limit=2).isError()
 
     # maxlen with a limit
     discard r.xadd(stream, "foo", "bar", maxlen=3, approximate=true, limit=2)
@@ -72,7 +75,8 @@ template syncTests() =
     discard r.del(@[stream])
 
     # maxlen and minid can not be provided together
-    discard r.xadd(stream, "foo", "bar", maxlen=3, minid="2").isError()
+    expect RedisError:
+      discard r.xadd(stream, "foo", "bar", maxlen=3, minid="2").isError()
 
     # minid with a limit
     discard r.xadd(stream, "foo", "bar")
@@ -190,6 +194,10 @@ template syncTests() =
     # no group is setup yet, no info to obtain
     check r.xinfoGroups(stream).len == 0
     check r.xgroupCreate(stream, group, "0").getStr() == "OK"
+
+    expect RedisError:
+      discard r.xgroupCreate(stream, group, "0")
+
     let expected = newRedisArray(@[
       &&"name",
       &&group,
@@ -208,7 +216,8 @@ template syncTests() =
 
     # an error is raised if a group is created on a stream that
     # doesn't already exist
-    check r.xgroupCreate(stream, group, "0").isError()
+    expect RedisError:
+      check r.xgroupCreate(stream, group, "0").isError()
 
     # however, with mkstream=True, the underlying stream is created automatically
     check r.xgroupCreate(stream, group, "0", mkstream = true).getStr() == "OK"
@@ -562,7 +571,8 @@ template syncTests() =
     discard r.xadd(stream, "foo", "bar")
     discard r.xadd(stream, "foo", "bar")
 
-    check r.xtrim(stream, 3, limit=2).isError()
+    expect RedisError:
+      check r.xtrim(stream, 3, limit=2).isError()
 
     # maxlen with a limit
     check r.xtrim(stream, 3, approximate=true, limit=2).getInt() == 0
