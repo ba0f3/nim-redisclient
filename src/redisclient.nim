@@ -27,7 +27,7 @@ type
     channel*: string
     message*: string
 
-template raiseError(x, msg) = raise newException(x, msg)
+template raiseError*(x, msg) = raise newException(x, msg)
 
 when defined(ssl):
   proc SSLifyRedisConnectionNoVerify(redis: var Redis|AsyncRedis) =

@@ -1,4 +1,4 @@
-import ../redisclient, asyncdispatch, times
+import ../redisclient, asyncdispatch, times, locks
 from os import sleep
 from net import Port
 
@@ -7,10 +7,22 @@ from net import Port
 
 type
   RedisConn[T: Redis|AsyncRedis] = ref object
-    active: bool
+    taken: bool
     conn: T
 
-  RedisPool*[T: Redis|AsyncRedis] = ref object
+when compileOption("threads"):
+  type RedisPool*[T: Redis|AsyncRedis] = ref object
+    conns: ptr UncheckedArray[RedisConn[T]]
+    host: string
+    port: Port
+    db: int
+    maxConns: int
+    noConnectivityTest: bool
+    isBlocking: bool
+    waitTimeout: float
+    lock: Lock
+else:
+  type RedisPool*[T: Redis|AsyncRedis] = ref object
     conns: seq[RedisConn[T]]
     host: string
     port: Port
@@ -19,23 +31,21 @@ type
     noConnectivityTest: bool
     isBlocking: bool
     waitTimeout: float
+    lock: Lock
+
 
 const
   WAIT_TIME_IN_MILISECONDS = 10
 
-template raiseException(x, msg) = raise newException(x, msg)
-
 proc newAsyncRedisConn(pool: RedisPool[AsyncRedis]): Future[RedisConn[AsyncRedis]] {.async.} =
   result = RedisConn[AsyncRedis](
-    conn: await openAsync(pool.host, pool.port),
-    active: false
+    conn: await openAsync(pool.host, pool.port)
   )
   discard await result.conn.select(pool.db)
 
 proc newRedisConn(pool: RedisPool[Redis]): RedisConn[Redis] =
   result = RedisConn[Redis](
-    conn: open(pool.host, pool.port),
-    active: false
+    conn: open(pool.host, pool.port)
   )
   discard result.conn.select(pool.db)
 
@@ -49,12 +59,18 @@ template newPoolImpl(x) =
     isBlocking: isBlocking,
     waitTimeout: waitTimeout
   )
-  for n in 0 ..< initSize:
+  when compileOption("threads"):
+    result.conns = cast[ptr UncheckedArray[RedisConn[x]]](allocShared0(sizeof(RedisConn[x]) * maxConns))
+  else:
+    result.conns = newSeq[RedisConn[x]](maxConns)
+
+  let initSize = if initSize > maxConns: maxConns else: initSize
+  for i in 0 ..< initSize:
     when x is Redis:
       var conn = newRedisConn(result)
     else:
       var conn = await newAsyncRedisConn(result)
-    result.conns.add(conn)
+    result.conns[i] = conn
 
 proc newAsyncRedisPool*(initSize: int, maxConns=10, host="localhost", port=6379, db=0, noConnectivityTest=false, isBlocking=true, waitTimeout=10.0): Future[RedisPool[AsyncRedis]] {.async.} =
   ## Create new AsyncRedis pool
@@ -63,33 +79,38 @@ proc newAsyncRedisPool*(initSize: int, maxConns=10, host="localhost", port=6379,
 proc newRedisPool*(initSize: int, maxConns=10, host="localhost", port=6379, db=0, noConnectivityTest=false, isBlocking=true, waitTimeout=10.0): RedisPool[Redis] =
   ## Create new Redis pool
   newPoolImpl(Redis)
+  initLock(result.lock)
 
 template acquireImpl(x) =
   let now = epochTime()
+  var freeSlotIndex = -1
   while true:
-    for i, rconn in pool.conns:
-      if not rconn.active:
+    for i in 0..<pool.maxConns:
+      if unlikely(pool.conns[i] == nil):
+        freeSlotIndex = i
+      elif not pool.conns[i].taken:
+        # FIXME: Why does noConnectivityTest make it slower
         if unlikely(not pool.noConnectivityTest):
           # Try to send PING to server to test for connection
           try:
             when x is Redis:
-              discard rconn.conn.ping()
+              let val = pool.conns[i].conn.ping()
             else:
-              discard await rconn.conn.ping()
+              let val = await pool.conns[i].conn.ping()
+            if val.getStr() != "PONG":
+              raiseError(InvalidReply, "PONG expected.")
           except:
-            pool.conns.del(i)
+            pool.conns[i] = nil
             break
-
-        rconn.active = true
-        result = rconn.conn
+        pool.conns[i].taken = true
+        result = pool.conns[i].conn
         break
-
     if result != nil:
-      # break while loop
+      # break `while true` loop
       break
 
     # All connections are busy, and no more slot to make new connection
-    if unlikely(pool.conns.len >= pool.maxConns):
+    if unlikely(freeSlotIndex < 0):
       # If `isBlocking` is set, wait for a connection till waitTimeout exceed
       if pool.isBlocking and epochTime() - now < pool.waitTimeout:
         when x is Redis:
@@ -98,16 +119,17 @@ template acquireImpl(x) =
           await sleepAsync(WAIT_TIME_IN_MILISECONDS)
         continue
       # Raise exception if not blocking, or blocking timed out
-      raiseException(ConnectionError, "No connection available.")
-
-    # Still having free slot, making new connection
-    when x is Redis:
-      let newConn = newRedisConn(pool)
+      raiseError(ConnectionError, "No connection available.")
     else:
-      let newConn = await newAsyncRedisConn(pool)
-    newConn.active = true
-    pool.conns.add newConn
-    result = newConn.conn
+      # Still having free slot, making new connection
+      when x is Redis:
+        let newConn = newRedisConn(pool)
+      else:
+        let newConn = await newAsyncRedisConn(pool)
+      newConn.taken = true
+      pool.conns[freeSlotIndex] = newConn
+      result = newConn.conn
+      break
 
 proc acquire*(pool: RedisPool[AsyncRedis]): Future[AsyncRedis] {.async.} =
   ## Acquires AsyncRedis connection from pool
@@ -115,27 +137,37 @@ proc acquire*(pool: RedisPool[AsyncRedis]): Future[AsyncRedis] {.async.} =
 
 proc acquire*(pool: RedisPool[Redis]): Redis =
   ## Acquires Redis connection from pool
+  pool.lock.acquire()
+  defer: pool.lock.release()
   acquireImpl(Redis)
 
 proc release*[T: Redis|AsyncRedis](pool: RedisPool[T], conn: T) =
   ## Returns connection to pool
-  for rconn in pool.conns:
-    if rconn.conn == conn:
-      rconn.active = false
+  for i in 0..<pool.maxConns:
+    if pool.conns[i] != nil and pool.conns[i].conn == conn:
+      pool.conns[i].taken = false
       break
 
 proc close(pool: RedisPool[AsyncRedis]) {.async.} =
   ## Close all connections
-  for rconn in pool.conns:
-    rconn.active = false
-    discard await rconn.conn.quit()
+  for i in 0..<pool.maxConns:
+    if pool.conns[i] != nil:
+      pool.conns[i].taken = false
+      discard await pool.conns[i].conn.quit()
+      pool.conns[i] = nil
+  when compileOption("threads"):
+    deallocShared(cast[pointer](pool.conns))
 
 proc close(pool: RedisPool[Redis]) =
   ## Close all connections
-  for rconn in pool.conns:
-    rconn.active = false
-    discard rconn.conn.quit()
-
+  for i in 0..<pool.maxConns:
+    if pool.conns[i] != nil:
+      pool.conns[i].taken = false
+      discard pool.conns[i].conn.quit()
+      pool.conns[i] = nil
+  deinitLock(pool.lock)
+  when compileOption("threads"):
+    deallocShared(cast[pointer](pool.conns))
 
 template withAcquire*[T: Redis|AsyncRedis](pool: RedisPool[T], conn, body: untyped) =
   ## Automatically acquire and release a connection
@@ -153,28 +185,28 @@ when isMainModule:
   proc main {.async.} =
     let pool = await newAsyncRedisPool(1)
     let conn = await pool.acquire()
-    echo await conn.ping()
+    echo (await conn.ping()).getStr()
     pool.release(conn)
 
     pool.withAcquire(conn2):
-      echo await conn2.ping()
+      echo (await conn2.ping()).getStr()
     await pool.close()
 
   proc sync =
     let pool = newRedisPool(1)
     let conn = pool.acquire()
-    echo conn.ping()
+    echo conn.ping().getStr()
     pool.release(conn)
 
     pool.withAcquire(conn2):
-      echo conn2.ping()
+      echo conn2.ping().getStr()
     pool.close()
 
   proc timeout =
     let pool = newRedisPool(3, maxConns=5, waitTimeout=1)
     for i in 0..6:
       let conn = pool.acquire()
-      echo conn.ping()
+      echo conn.ping().getStr()
     pool.close()
 
   proc closed =
@@ -185,7 +217,7 @@ when isMainModule:
     discard stdin.readLine
     for i in 0..5:
       pool.withAcquire(conn):
-        echo conn.ping()
+        echo conn.ping().getStr()
     pool.close()
 
   waitFor main()
