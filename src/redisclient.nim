@@ -612,7 +612,7 @@ proc zrange*(this: Redis | AsyncRedis, key: string, start: SomeInteger, stop: So
             withScores: bool = false): Future[RedisValue] {.multisync.} =
   ## Return a range of members in a sorted set, by index
   var args = @[$start, $stop]
-  if not withScores:
+  if withScores:
     args.add("WITHSCORES")
   return await this.execCommand("ZRANGE", key, args)
 
